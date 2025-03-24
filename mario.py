@@ -373,7 +373,7 @@ if __name__ == "__main__":
     print(f"Using device: {mario.device}")
     logger = MetricLogger(save_dir)
 
-    episodes = 40
+    episodes = 400
     for e in range(episodes):
         state = env.reset()
         while True:
