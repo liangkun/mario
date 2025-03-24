@@ -1,6 +1,7 @@
 data/
 checkpoints/
 __pycache__/
+.DS_Store/
 .vscode/
 *.pt
 *.pth
