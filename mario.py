@@ -27,7 +27,13 @@ from gym.spaces import Box
 from gym.wrappers.frame_stack import FrameStack
 from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
 
+OB_H = 84
+OB_W = 84
+NUM_SKIP = 4
+NUM_STACK = 4
+ACTIONS = RIGHT_ONLY
 
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip):
@@ -92,10 +98,10 @@ class MarioNet(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
-        if h != 84:
-            raise ValueError(f"expect input height 84, got {h}")
-        if w != 84:
-            raise ValueError(f"expect input width 84, got {w}")
+        if h != OB_H:
+            raise ValueError(f"expect input height {OB_H}, got {h}")
+        if w != OB_W:
+            raise ValueError(f"expect input width {OB_W}, got {w}")
         
         self.online = self.__build_cnn(c, output_dim)
 
@@ -128,10 +134,10 @@ class MarioNet(nn.Module):
 
 
 class Mario:
-    def __init__(self, state_dim, action_dim, save_dir):
+    def __init__(self, state_dim, action_dim, options):
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.save_dir = save_dir
+        self.save_dir = Path(options.save_dir)
     
         self.device = "cpu"
         if torch.cuda.is_available():
@@ -142,18 +148,18 @@ class Mario:
         self.net = MarioNet(self.state_dim, self.action_dim).float()
         self.net = self.net.to(device=self.device)
 
-        self.exploration_rate = 1
+        self.exploration_rate = options.exploration_rate
         self.exploration_rate_decay = 0.99999975
-        self.exploration_rate_min = 0.1
+        self.exploration_rate_min = options.exploration_rate_min
         self.curr_step = 0
         self.save_every = 5e5
         self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000,
                                              device=torch.device("cpu")))
-        self.batch_size = 32
+        self.batch_size = options.batch_size
         self.gamma = 0.9
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=options.lr)
         self.loss_fn = torch.nn.SmoothL1Loss()
-        self.burnin = 1e4 # 开始训练前最少的动作数
+        self.burnin = options.burnin # 开始训练前最少的动作数
         self.learn_every = 3
         self.sync_every = 1e4
 
@@ -249,8 +255,11 @@ class Mario:
     def save(self):
         """保存检查点"""
         save_path = self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt"
-        torch.save(dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate), save_path)
+        torch.save(self.net.state_dict(), save_path)
         print(f"MarioNet saved to {save_path} at step {self.curr_step}.")
+    
+    def load(self, modelfile):
+        self.net.load_state_dict(torch.load(modelfile))
 
 
 class MetricLogger:
@@ -349,33 +358,29 @@ class MetricLogger:
             plt.legend()
             plt.savefig(getattr(self, f"{metric}_plot"))
 
-def create_mario_env():
-    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode="rgb", apply_api_compatibility=True)
-    env = JoypadSpace(env, [["right"], ["right", "A"]])
+def create_mario_env(options):
+    train = options.mode == "train"
+    render_mode = "rgb" if train else "human"
 
-    env = SkipFrame(env, skip=4)
+    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode=render_mode, apply_api_compatibility=True)
+    env = JoypadSpace(env, ACTIONS)
+
+    env = SkipFrame(env, skip=NUM_SKIP)
     env = GrayScaleObservation(env)
     env = ResizeObservation(env, shape=84)
-    env = FrameStack(env, num_stack=4)
+    env = FrameStack(env, num_stack=NUM_STACK)
 
     return env
 
 
-
-if __name__ == "__main__":
-    env = create_mario_env()
-
-    save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    save_dir.mkdir(parents=True)
-
-    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
- 
-    print(f"Using device: {mario.device}")
+def train(mario, env, options):
+    save_dir = Path(options.save_dir)
     logger = MetricLogger(save_dir)
 
-    episodes = 400
+    episodes = options.episodes
     for e in range(episodes):
         state = env.reset()
+        steps = 0
         while True:
             action = mario.act(state)
             next_state, reward, done, trunc, info = env.step(action)
@@ -385,10 +390,67 @@ if __name__ == "__main__":
 
             state = next_state
 
-            if done or info["flag_get"]:
+            steps += 1
+
+            if done or info["flag_get"] or steps >= options.max_episode_length:
                 break
         
         logger.log_episode()
 
         if (e % 20 == 0) or (e == episodes - 1):
             logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
+
+
+def test(mario, env, options):
+    episodes = options.episodes
+    for e in range(episodes):
+        state = env.reset()
+        steps = 0
+        episode_reward = 0
+        while True:
+            action = mario.act(state)
+            next_state, reward, done, trunc, info = env.step(action)
+            state = next_state
+            episode_reward += reward
+            steps += 1
+            if done or info["flag_get"] or steps > options.max_episode_length:
+                break
+            time.sleep(0.05)
+
+        print(f"episode: {e}, steps: {steps}, reward: {episode_reward}")
+
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    parser = argparse.ArgumentParser("Robot Mario")
+    parser.add_argument("--lr", type=float, default=0.00025)
+    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--max_episode_length", type=int, default=5000)
+    parser.add_argument("--mode", type=str, default="test")
+    parser.add_argument("--modelfile", type=str, default="")
+    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--burnin", type=int, default=1e4)
+    parser.add_argument("--exploration_rate", type=float, default=1.0)
+    parser.add_argument("--exploration_rate_min", type=float, default=0.1)
+    options = parser.parse_args(sys.argv[1:])
+
+    save_dir = Path(options.save_dir)
+    if not save_dir.exists():
+        save_dir.mkdir(parents=True)
+
+    env = create_mario_env(options)
+    mario = Mario(state_dim=(NUM_STACK, OB_H, OB_W), action_dim=len(ACTIONS), options=options)
+    if options.modelfile:
+        mario.load(options.modelfile)
+
+    print(f"Using device: {mario.device}")
+
+    if options.mode == "train":
+        train(mario, env, options)
+    elif options.mode == "test":
+        test(mario, env, options)
+    else:
+        print(f"unknown running mode {options.mode}, specify ether 'test' or 'train'.")
